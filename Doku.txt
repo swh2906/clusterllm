@@ -1,0 +1,92 @@
+5.1   System- & Treiberkonfiguration
+Zunächst wurden die Systeme aktualisiert und die für den Build erforderlichen Pakete installiert. Die NVIDIA-Treiberversion muss einheitlich gewählt werden, um Paket- und Abhängigkeitskonflikten zu vermeiden. Alle Nodes werden anfangs identisch konfiguriert. Die genutzte Treiberversion ist nvidia-driver-580 (unterstützt CUDA bis 13.0, installiertes Toolkit 11.5, siehe 5.6) bei Ubuntu 22.04.5 LTS.
+sudo apt update	
+sudo apt upgrade -y
+sudo apt install -y nvidia-driver-580
+sudo reboot
+Nach dem Neustart wurde die erfolgreiche Treiberinstallation mit dem Befehl nvidia-smi überprüft. 
+ 
+Anschließend wurden CUDA, Build-Werkzeuge und Hilfsprogramme installiert:
+sudo apt install -y nvidia-cuda-toolkit
+sudo apt install -y python3 cmake build-essential \
+git gcc-10 g++-10
+sudo apt install -y libcurl4-openssl-dev python3-venv
+sudo apt install -y btop nvtop pipx 
+pipx install nvitop
+Die Build-Tools ermöglichen das Kompilieren von llama.cpp. CUDA wird benötigt, damit llama.cpp die verbauten NVIDIA-GPUs über das CUDA-Backend ansprechen kann. Die offizielle Build-Dokumentation nennt -DGGML_CUDA=ON als CMake-Option für CUDA-Builds.
+5.2   Netzwerkkonfiguration
+Ziel der Netzwerkkonfiguration war es, eine zuverlässige und störungsfreie Kommunikation zwischen den Cluster-Nodes sicherzustellen und den Cluster-Datenverkehr vom normalen Internetverkehr zu trennen. Dafür wurde ein separates IPv4-Netzwerksegment im privaten Adressbereich verwendet (10.10.10.0/24). Dieses Subnetz bietet mit 254 nutzbaren Adressen ausreichend Raum für spätere Erweiterungen, ohne dass ein komplexeres Subnetzdesign nötig ist.
+Die Konfiguration erfolgte unter Ubuntu über Netplan. Als Beispiel wird die Konfiguration von Node-02 mit der IP-Adresse 10.10.10.7 gezeigt:
+network:
+  ethernets:
+    enx607d09b6fdf2:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      addresses:
+        - 10.10.10.7/24
+      optional: false
+
+
+sudo nano /etc/netplan/*.yaml
+sudo netplan try
+Anschließend wurde die Konfiguration mit sudo netplan try getestet und bei Erfolg durch Bestätigung dauerhaft übernommen. Danach wurde die Erreichbarkeit der Nodes systematisch geprüft.
+
+
+Alle Nodes sind im Cluster-Netzwerk 10.10.10.0/24 erreichbar, sodass die weitere Konfiguration des llama.cpp-RPC-Clusters fortgesetzt werden konnte. Zur Erhöhung der Sicherheit wird zusätzlich eine Firewall-Regel definiert, die Zugriffe auf das Cluster-Netz nur von den bekannten Node-IPs erlaubt und andere Zugriffe blockiert (siehe 5.7   Sicherheits- und Betriebskonzept).
+5.3   Kompilierung von llama.cpp
+Für die verteilte Inferenz wurde llama.cpp aus dem offiziellen GitHub Repository ggml-org/llama.cpp heruntergeladen. Um eine einheitliche und reproduzierbare Version auf allen Nodes sicherzustellen, wurde ein fester Git Commit verwendet. Der Commit daef7b6874397a5a7c3d7e38b55e2ee0adf7da38 wurde ausgewählt, da er zum Zeitpunkt der Implementierung als stabil galt und die benötigte RPC Funktionalität vollständig unterstützt. Die vollständige Commit ID wurde zur späteren Nachvollziehbarkeit in der Datei /home/aiadmin/llama-rpc-sync.commit gespeichert. Dadurch konnte sichergestellt werden, dass die Kompilierung auf einem eindeutig dokumentierten Quellcode¬stand erfolgte. 
+Vor dem Kompilieren wurde der Build mit aktivierter CUDA- und RPC-Unterstützung konfiguriert:
+cmake -S /home/aiadmin/src/llama.cpp-rpc-sync \
+  -B /home/aiadmin/build-llama-rpc-sync \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON \
+  -DGGML_RPC=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=75 \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc-10 \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++-10 \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10
+Die Option CMAKE_BUILD_TYPE=Release sorgt für einen optimierten Build. GGML_CUDA=ON aktiviert die Nutzung der NVIDIA GPUs, GGML_RPC=ON ermöglicht die Kommunikation mit weiteren Rechenknoten über das RPC Backend. Die CUDA Architektur wurde auf 75 (Compute Capability 7.5 Turing-Architektur) beschränkt, um die Build Zeit zu verkürzen und die Binärdateien kleiner zu halten, dies ist ausreichend für die im Cluster verwendeten GPUs, die alle auf der Turing Architektur basieren. Als Compiler wurde explizit GCC 10 gewählt, um Kompatibilitätsprobleme mit dem CUDA Toolkit zu vermeiden.
+Danach wurde llama.cpp mit allen verfügbaren CPU-Kernen kompiliert:
+cmake --build /home/aiadmin/build-llama-rpc-sync -j"$(nproc)"
+Nach dem Kompilieren wurde geprüft, ob die benötigten Binärdateien vorhanden sind. Mit ls -lh /home/aiadmin/build-llama-rpc-sync/bin/ wurde sichergestellt, dass mindestens rpc-server und llama-cli erzeugt wurden. Zusätzlich wurde die Version der Binaries über die integrierte Hilfe (--help) bzw. Versionsausgabe geprüft, um sicherzustellen, dass der erwartete Build tatsächlich verwendet wird. 
+ls -lh /home/aiadmin/build-llama-rpc-sync/bin/
+
+
+5.4   Konfiguration und Start der RPC-Server
+Der RPC Server wird auf allen Worker Nodes im Hintergrund gestartet, lauscht auf der jeweiligen Node IP und Port 50052 und stellt deren Rechenressourcen im Netzwerk für llama.cpp bereit. Durch das Starten im Hintergrund bleibt der Server auch nach dem Schließen der SSH Sitzung aktiv, und die Umleitung der Ausgabe in eine Log Datei ermöglicht eine später vereinfachte Fehlersuche.
+Beispiel für Node 02 (IP 10.10.10.7):
+nohup /home/aiadmin/build-llama-rpc-sync/bin/ggml-rpc-server \
+-H 10.10.10.7   -p 50052   \
+> /home/aiadmin/ggml-rpc-node-02-sync.log 2>&1 &
+Die Erreichbarkeit der Worker Nodes wurde vom Control Plane Node aus getestet. Dazu wurde entweder netcat verwendet, um den TCP Port zu prüfen, oder llama.cpp selbst, um die Remote Devices aufzulisten:
+ /home/aiadmin/build-llama-client-sync/bin/llama-cli --rpc 10.10.10.7:50052 --list-devices
+Im erfolgreichen Fall listet llama-cli das Remote Device (z. B. RPC 10.10.10.7:50052) auf, bei nc wird eine erfolgreiche TCP Verbindung gemeldet. Damit war sichergestellt, dass alle Worker Nodes korrekt erreichbar sind und für die verteilte Inferenz verwendet werden können.
+Abb. 6 Auflistung der RPC-Geräte:
+ 
+5.5   Durchführung der LLM-Inferenz 
+Die verwendeten Sprachmodelle wurden über die Plattform Hugging Face bezogen. Hugging Face wurde ausgewählt, da dort eine große Auswahl an vorkonvertierten GGUF-Modellen verfügbar ist, die direkt mit llama.cpp verwendet werden können. GGUF ist ein für llama.cpp optimiertes Modellformat und ermöglicht eine effiziente Inferenz auf CPU- und GPU-Systemen.
+Die Modelle wurden mithilfe der integrierten -hf-Option von llama.cpp direkt aus Hugging Face geladen. Anschließend wurden sie mit llama-cli unter Verwendung der entsprechenden Modellreferenz für die lokale Inferenz ausgeführt. Der folgende Befehl demonstriert eine beispielhafte Textgenerierung auf einem Rechenknoten:
+/home/aiadmin/build-llama-client-sync/bin/llama-cli \
+  -hf unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL \
+  --device CUDA0 \
+  -ngl 24   -c 512   -ctk q8_0   -ctv q8_0   -fa on   -b 512   -ub 512 \
+  -p "was ist 2 + 2"   -n 256   --seed 42   --temp 0   --no-mmproj
+Der Parameter -hf bezeichnet dabei das Hugging‑Face‑Repository sowie die zu verwendende GGUF‑Variante. In diesem Fall wird das instruction‑tuned Gemma‑4‑Modell mit 12 Milliarden Parametern mit QAT-Gewichten in der Quantisierung UD-Q4_K_XL geladen. Das Modell verfügt über 48 Transformer‑Layer (model.block_count = 48 in der Modellkonfiguration).
+Der Parameter --device CUDA0 weist llama.cpp an, das erste CUDA-Gerät zu verwenden. Mit -ngl 24 wird festgelegt, dass bis zu 24 Modell-Layer auf die GPU ausgelagert werden. -c 512 definiert die Größe des Kontextfensters auf insgesamt 512 Tokens inklusive Eingabeprompt. Die Optionen -ctk q8_0 und -ctv q8_0 legen die Quantisierung des Key-Value-Caches fest.
+-b 512 und -ub 512 definieren die logische beziehungsweise physische Batch-Größe. -p übergibt den Eingabeprompt, während -n 256 die maximale Anzahl der neu zu erzeugenden Tokens festlegt. Durch --seed 42 wird ein reproduzierbarer Zufallsstartwert verwendet.     --temp 0 deaktiviert praktisch die zufällige Auswahl und führt zu einer deterministischeren Ausgabe. Die Option --no-mmproj deaktiviert die Verwendung eines Multimodal-Projektors, sodass der Aufruf ausschließlich für die Textinferenz verwendet wird.
+Der Multi-Node-Befehl erweitert den Single-Node-Befehl um vier zusätzliche Parameter (--rpc, --split-mode, --tensor-split, --fit) und passt zwei bestehende Parameter (--device, -ngl) an, um die Inferenzlast auf mehrere Rechenknoten zu verteilen. Der Parameter --rpc definiert die Netzwerkadressen der Worker-Nodes (10.10.10.6–8:50052), über die sich die Control Plane mit den RPC-Servern der Worker verbindet. Die Option --device wird von CUDA0 auf RPC0, RPC1, RPC2, CUDA0 erweitert, sodass drei Remote-GPUs plus die lokale GPU genutzt werden.
+Mit -ngl all (statt 24) werden alle Transformer-Layer auf die kombinierten GPUs ausgelagert, da durch die Verteilung ausreichend VRAM zur Verfügung steht. Der Parameter --split-mode layer legt fest, dass ganze Layer sequenziell auf die Geräte verteilt werden, was den Netzwerk-Overhead minimiert. Die Option --tensor-split 1,1,1,1 definiert eine gleichmäßige Aufteilung der Layer auf alle vier Geräte. Durch --fit off wird die automatische Anpassung der Split-Ratio deaktiviert, um reproduzierbare Ergebnisse zu gewährleisten.
+
+/home/aiadmin/build-llama-client-sync/bin/llama-cli \ 
+  -hf unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL \
+  --rpc 10.10.10.6:50052,10.10.10.7:50052,10.10.10.8:50052 \
+  --device RPC0,RPC1,RPC2,CUDA0 \
+  --split-mode layer --tensor-split 1,1,1,1 \
+  --fit off -ngl all -c 512 -ctk q8_0 -ctv q8_0 \
+  -fa on -b 512 -ub 512 \
+  -p "was ist 2 + 2" -n 256 \
+  --seed 42 --temp 0 --no-mmproj
+5.6   Herausforderung
+Nach der Treiberinstallation zeigte nvidia-smi für den Treiber 580 eine unterstützte CUDA-Version bis 13.0 an. Das über die Ubuntu-Paketquellen installierte CUDA-Toolkit ist jedoch Version 11.5 (V11.5.119), wie nvcc --version zeigt. Die Anzeige von nvidia-smi gibt nur die maximal unterstützte CUDA-Version des Treibers an, nicht die des installierten Toolkits. Bei der Kompilierung von llama.cpp schlug der Build zunächst fehl [#error -- unsupported GNU version! gcc versions later than 11 are not supported!], weil nvcc 11.5 neuere GCC-Versionen nicht unterstützt. Durch Recherche in der NVIDIA-Dokumentation und den Ubuntu-Paketinformationen wurde die Ursache identifiziert. Die Lösung bestand in der Einführung einer einheitlichen Toolchain. Durch die explizite Vorgabe von GCC 10 über die CMake-Parameter -DCMAKE_C_COMPILER, -DCMAKE_CXX_COMPILER und -DCMAKE_CUDA_HOST_COMPILER wurde sichergestellt, dass die Kompatibilität zwischen CUDA 11.5 und dem Compiler auf allen Nodes identisch ist. Dies war entscheidend für die Reproduzierbarkeit des Builds und verhinderte Node-spezifische Fehler.
